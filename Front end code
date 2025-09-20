@@ -1,0 +1,268 @@
+import streamlit as st
+import backend_analytics
+import pandas as pd
+from datetime import date, timedelta
+import plotly.express as px
+
+# Set Streamlit page configuration
+st.set_page_config(layout="wide", page_title="Simple PMS Dashboard")
+
+# --- User & Session State Management (for simple demo) ---
+# In a real app, this would be handled with a proper login system.
+# We will simulate a user and their role.
+if 'current_user' not in st.session_state:
+    st.session_state.current_user = {
+        'id': 1,
+        'name': 'John Smith',
+        'role': 'Manager'  # Change to 'Employee' to test employee view
+    }
+    
+def get_user_role():
+    return st.session_state.current_user['role']
+
+def get_user_id():
+    return st.session_state.current_user['id']
+    
+# --- Main Application ---
+def main():
+    st.title(f"Performance Management System")
+    st.markdown("---")
+
+    # Sidebar for navigation and user info
+    st.sidebar.header("User Information")
+    st.sidebar.write(f"**Name:** {st.session_state.current_user['name']}")
+    st.sidebar.write(f"**Role:** {get_user_role()}")
+    st.sidebar.markdown("---")
+    
+    st.sidebar.header("Navigation")
+    menu = ["Dashboard", "Goals", "Tasks", "Feedback", "Insights"]
+    choice = st.sidebar.selectbox("Go to:", menu)
+
+    # Database setup
+    if not backend_analytics.create_tables():
+        st.error("Could not connect to the database. Please check your `backend_analytics.py` file and ensure the database server is running.")
+        return
+    st.sidebar.success("Database connection successful.")
+
+    # Check and create default employee if they don't exist
+    if not backend_analytics.read_employee_by_id(get_user_id()):
+        backend_analytics.create_employee(st.session_state.current_user['name'], st.session_state.current_user['role'])
+        st.success(f"Default user '{st.session_state.current_user['name']}' created successfully!")
+    
+    # --- Page: Dashboard ---
+    if choice == "Dashboard":
+        st.header("Dashboard Overview")
+        st.write("Welcome to your personal performance dashboard. View your goals, tasks, and key performance metrics at a glance.")
+
+        user_id = get_user_id()
+        goals = backend_analytics.read_goals(user_id)
+        
+        if not goals:
+            st.info("You have no goals set yet. Please go to the 'Goals' section to add one.")
+            return
+
+        # Display goals in a collapsible list
+        for goal in goals:
+            with st.expander(f"Goal: {goal['description'][:50]}..."):
+                st.markdown(f"**Status:** `{goal['status']}`")
+                st.markdown(f"**Due Date:** `{goal['due_date'].strftime('%Y-%m-%d')}`")
+                st.markdown(f"**Description:** {goal['description']}")
+                
+                # Progress tracking
+                tasks = backend_analytics.read_tasks(goal['goal_id'])
+                if tasks:
+                    completed_tasks = sum(1 for t in tasks if t['completed'])
+                    total_tasks = len(tasks)
+                    st.progress(completed_tasks / total_tasks if total_tasks > 0 else 0, text=f"Progress: {completed_tasks}/{total_tasks} tasks completed")
+                    
+                    st.subheader("Associated Tasks")
+                    tasks_df = pd.DataFrame(tasks)
+                    st.dataframe(tasks_df[['description', 'completed', 'is_approved']], use_container_width=True)
+                else:
+                    st.info("No tasks associated with this goal.")
+
+    # --- Page: Goals ---
+    elif choice == "Goals":
+        st.header("Goal Management")
+        
+        if get_user_role() == 'Manager':
+            st.subheader("Create a New Goal")
+            with st.form("new_goal_form"):
+                goal_desc = st.text_area("Goal Description", help="Enter a clear, specific goal.")
+                due_date = st.date_input("Due Date", min_value=date.today())
+                submit_button = st.form_submit_button("Create Goal")
+                
+                if submit_button:
+                    if goal_desc and due_date:
+                        if backend_analytics.create_goal(get_user_id(), goal_desc, due_date):
+                            st.success("Goal created successfully!")
+                        else:
+                            st.error("Failed to create goal.")
+                    else:
+                        st.warning("Please fill in all fields.")
+
+        st.subheader("Your Goals")
+        goals = backend_analytics.read_goals(get_user_id())
+        
+        if not goals:
+            st.info("No goals to display.")
+        else:
+            df_goals = pd.DataFrame(goals)
+            df_goals['due_date'] = pd.to_datetime(df_goals['due_date']).dt.strftime('%Y-%m-%d')
+            st.dataframe(df_goals[['goal_id', 'description', 'due_date', 'status']], use_container_width=True)
+            
+            # Update and Delete Goals (Manager Only)
+            if get_user_role() == 'Manager':
+                st.markdown("---")
+                st.subheader("Update or Delete Goals")
+                goal_ids = df_goals['goal_id'].tolist()
+                selected_goal_id = st.selectbox("Select Goal ID to manage", goal_ids, key="goal_select_box")
+                
+                if selected_goal_id:
+                    selected_goal = df_goals[df_goals['goal_id'] == selected_goal_id].iloc[0]
+                    with st.expander("Update Goal"):
+                        st.warning("Note: This will overwrite the selected goal.")
+                        new_desc = st.text_area("New Description", value=selected_goal['description'])
+                        new_due_date = st.date_input("New Due Date", value=selected_goal['due_date'])
+                        new_status = st.selectbox("New Status", ['Draft', 'In Progress', 'Completed', 'Cancelled'], index=['Draft', 'In Progress', 'Completed', 'Cancelled'].index(selected_goal['status']))
+                        
+                        if st.button("Update Goal"):
+                            if backend_analytics.update_goal(selected_goal_id, new_desc, new_due_date, new_status):
+                                st.success("Goal updated successfully!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to update goal.")
+                    
+                    if st.button("Delete Goal", help="Permanently delete the goal and all associated tasks/feedback."):
+                        if backend_analytics.delete_goal(selected_goal_id):
+                            st.success("Goal deleted successfully.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete goal.")
+
+    # --- Page: Tasks ---
+    elif choice == "Tasks":
+        st.header("Task Tracking")
+        
+        goals = backend_analytics.read_goals(get_user_id())
+        if not goals:
+            st.info("You must have a goal to add a task. Please create one in the 'Goals' section.")
+            return
+
+        goal_options = {f"ID: {g['goal_id']} - {g['description'][:40]}...": g['goal_id'] for g in goals}
+        selected_goal_key = st.selectbox("Select a Goal to add/view tasks for", list(goal_options.keys()))
+        selected_goal_id = goal_options[selected_goal_key]
+
+        st.subheader("Add a New Task")
+        with st.form("new_task_form"):
+            task_desc = st.text_area("Task Description", help="Describe the task you'll do to achieve this goal.")
+            submit_task = st.form_submit_button("Add Task")
+            if submit_task:
+                if task_desc:
+                    if backend_analytics.create_task(selected_goal_id, get_user_id(), task_desc):
+                        st.success("Task added successfully! It is awaiting manager approval.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to add task.")
+                else:
+                    st.warning("Please provide a task description.")
+
+        st.subheader("Your Tasks for This Goal")
+        tasks = backend_analytics.read_tasks(selected_goal_id)
+        if tasks:
+            for task in tasks:
+                col1, col2, col3 = st.columns([0.6, 0.2, 0.2])
+                with col1:
+                    st.write(task['description'])
+                with col2:
+                    st.write(f"Approved: {'✅' if task['is_approved'] else '❌'}")
+                with col3:
+                    is_completed = st.checkbox("Completed?", value=task['completed'], key=f"task_completed_{task['task_id']}")
+                    if is_completed != task['completed']:
+                        backend_analytics.update_task_status(task['task_id'], is_completed, task['is_approved'])
+                        st.rerun()
+        else:
+            st.info("No tasks for this goal yet.")
+
+    # --- Page: Feedback ---
+    elif choice == "Feedback":
+        st.header("Feedback")
+        
+        goals = backend_analytics.read_goals(get_user_id())
+        if not goals:
+            st.info("No goals to provide or view feedback on.")
+            return
+
+        goal_options = {f"ID: {g['goal_id']} - {g['description'][:40]}...": g['goal_id'] for g in goals}
+        selected_goal_key = st.selectbox("Select a Goal to view feedback for", list(goal_options.keys()))
+        selected_goal_id = goal_options[selected_goal_key]
+
+        # Managers can provide feedback
+        if get_user_role() == 'Manager':
+            st.subheader("Provide New Feedback")
+            with st.form("feedback_form"):
+                feedback_text = st.text_area("Feedback on this Goal")
+                submit_feedback = st.form_submit_button("Submit Feedback")
+                if submit_feedback:
+                    if feedback_text:
+                        # Assuming manager_id is 1 for this demo
+                        if backend_analytics.create_feedback(selected_goal_id, get_user_id(), get_user_id(), feedback_text):
+                            st.success("Feedback submitted!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to submit feedback.")
+                    else:
+                        st.warning("Feedback cannot be empty.")
+        
+        st.subheader("Feedback History")
+        feedbacks = backend_analytics.read_feedback(selected_goal_id)
+        if feedbacks:
+            for feedback in feedbacks:
+                with st.expander(f"Feedback ID: {feedback['feedback_id']} - {feedback['created_at'].strftime('%Y-%m-%d')}"):
+                    st.write(feedback['feedback_text'])
+        else:
+            st.info("No feedback for this goal yet.")
+
+    # --- Page: Insights ---
+    elif choice == "Insights":
+        st.header("Business Insights & Reports")
+        st.write("A clear view of your performance history, including all past and present goals and feedback.")
+        
+        metrics = backend_analytics.get_pms_metrics(get_user_id())
+        
+        if not metrics or metrics.get('total_goals', 0) == 0:
+            st.info("No data available to generate insights. Please create some goals and tasks.")
+            return
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Goals", metrics.get('total_goals', 0))
+        with col2:
+            st.metric("Completed Tasks", metrics.get('completed_tasks', 0))
+        with col3:
+            st.metric("Avg. Task Completion", f"{metrics.get('avg_task_completion_days', 0)} days")
+        with col4:
+            st.metric("Next Due Date", metrics.get('min_due_date', "N/A"))
+
+        st.markdown("---")
+        
+        st.subheader("Goal Status Breakdown")
+        goal_counts = metrics.get('goal_counts', {})
+        if goal_counts:
+            df_goals_status = pd.DataFrame(list(goal_counts.items()), columns=['Status', 'Count'])
+            fig_pie = px.pie(df_goals_status, values='Count', names='Status', title='Goals by Status')
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        st.subheader("Goals Due Soon")
+        goals = backend_analytics.read_goals(get_user_id())
+        due_soon_goals = [g for g in goals if g['due_date'] <= date.today() + timedelta(days=7) and g['status'] in ('Draft', 'In Progress')]
+        if due_soon_goals:
+            df_due_soon = pd.DataFrame(due_soon_goals)
+            df_due_soon['due_date'] = pd.to_datetime(df_due_soon['due_date']).dt.strftime('%Y-%m-%d')
+            st.dataframe(df_due_soon[['goal_id', 'description', 'due_date', 'status']], use_container_width=True)
+        else:
+            st.info("No goals are due in the next 7 days.")
+
+if __name__ == "__main__":
+    main()
+
